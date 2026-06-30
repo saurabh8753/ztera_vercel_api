@@ -302,6 +302,83 @@ def resolve_playlist(raw_url: str, preferred_quality: str = "M3U8_AUTO_720") -> 
     )
 
 
+# ── Direct CDN download link (dlink) — single mp4 URL, not chunked ─────────
+#
+# NOTE: TeraBox doesn't expose `dlink` on the public `/api/shorturlinfo` call.
+# It requires a separate authenticated call to `/api/filemetas`. This is
+# reverse-engineered from observed traffic and is less stable than the
+# streaming endpoints:
+#   - Often IP-bound (the IP that requested it must be the one that fetches it)
+#   - Frequently restricted to premium/VIP cookies — non-premium accounts may
+#     get errno != 0 even when streaming works fine
+#   - Short-lived (typically a few hours)
+# Because of this, treat it as a "best effort, may not always work" path and
+# always have the chunked playlist as a fallback.
+
+def get_dlink(session: requests.Session, shareid, uk, sign, timestamp, fs_id, surl: str = "") -> str:
+    params = {
+        "app_id": "250528", "channel": "dubox", "clienttype": "0",
+        "web": "1", "shareid": str(shareid), "uk": str(uk),
+        "sign": sign, "timestamp": str(timestamp),
+        "fid_list": f"[{fs_id}]", "dp-logid": _logid(), "type": "dlink",
+    }
+    hdrs = _headers(session, surl)
+    hdrs.update({"Accept": "application/json, text/plain, */*", "Origin": BASE_URL})
+
+    resp = session.get(f"{BASE_URL}/api/filemetas", params=params, headers=hdrs, timeout=20)
+    try:
+        data = resp.json()
+    except ValueError:
+        raise TeraBoxError("filemetas did not return JSON (likely blocked/banned response)")
+
+    if data.get("errno") != 0:
+        raise TeraBoxError(f"filemetas failed: errno={data.get('errno')} (dlink often needs premium cookie / VIP account)")
+
+    info_list = data.get("info", [])
+    if not info_list or not info_list[0].get("dlink"):
+        raise TeraBoxError("No dlink in filemetas response (not available for this file/account)")
+
+    return info_list[0]["dlink"]
+
+
+def resolve_download(raw_url: str, preferred_quality: str = "M3U8_AUTO_720") -> dict:
+    """
+    Tries to get a direct single-file CDN dlink first (fast, no chunking).
+    If unavailable/fails, automatically falls back to building a full
+    chunked M3U8 playlist (always works if cookies are valid, just slower).
+    """
+    base = resolve_terabox_link(raw_url)
+    session = load_session()
+
+    try:
+        dlink = get_dlink(
+            session, base["shareid"], base["uk"], base["sign"], base["timestamp"],
+            base["fs_id"], surl=base["surl"],
+        )
+        return {
+            "filename": base["filename"],
+            "size": base["size"],
+            "size_mb": base["size_mb"],
+            "thumb": base["thumb"],
+            "method": "direct_dlink",
+            "download_url": dlink,
+        }
+    except TeraBoxError as dlink_err:
+        # Fallback: build a playable/downloadable chunked playlist instead
+        playlist_data = resolve_playlist(raw_url, preferred_quality=preferred_quality)
+        return {
+            "filename": base["filename"],
+            "size": base["size"],
+            "size_mb": base["size_mb"],
+            "thumb": base["thumb"],
+            "method": "fallback_playlist",
+            "fallback_reason": str(dlink_err),
+            "quality_used": playlist_data["quality_used"],
+            "chunks_found": playlist_data["chunks_found"],
+            "manifest": playlist_data["manifest"],
+        }
+
+
 # ── Public function: full metadata + links in one call ─────────────────────
 
 QUALITIES = ["M3U8_AUTO_1080", "M3U8_AUTO_720", "M3U8_AUTO_480", "M3U8_AUTO_360"]
