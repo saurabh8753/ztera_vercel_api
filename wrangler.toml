@@ -1,0 +1,8 @@
+name = "ztera-terabox-api"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+
+# Cookies are set as secrets, NOT here:
+#   wrangler secret put COOKIES1
+#   wrangler secret put COOKIES2
+# (repeat for as many cookie sets as you have)
