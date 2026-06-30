@@ -174,6 +174,134 @@ def get_first_chunk_cdn_url(session: requests.Session, shareid, uk, sign, timest
     return text
 
 
+# ── Real chunk discovery (TeraBox's /share/streaming returns ONE random
+#    chunk per request — we must poll repeatedly to collect them all) ───────
+
+def discover_all_hls_chunks(session: requests.Session, shareid, uk, sign, timestamp,
+                             fs_id, quality: str, surl: str = "",
+                             max_budget: int = 40, time_budget_sec: float = 18.0) -> list:
+    """
+    Polls the streaming endpoint repeatedly to discover every unique TS chunk.
+    Budget kept low (vs the original bot) to fit inside Vercel's execution timeout.
+    Returns a list of (chunk_idx, signed_cdn_url, ts_size) sorted by idx.
+    Returns [] if this quality isn't available at all (e.g. not transcoded for this file).
+    """
+    start_t = time.time()
+    known = {}
+    req_count = 0
+    no_new_streak = 0
+    max_idx = -1
+
+    while True:
+        if req_count >= max_budget or (time.time() - start_t) > time_budget_sec:
+            break
+
+        req_count += 1
+        url = build_streaming_url(shareid, uk, sign, timestamp, fs_id, quality)
+        try:
+            text = session.get(url, headers=_headers(session, surl), timeout=15).text.strip()
+        except requests.RequestException:
+            time.sleep(0.5)
+            continue
+
+        if not text.startswith("#EXTM3U"):
+            time.sleep(0.3)
+            continue
+
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parsed = urlparse(line)
+            p = parse_qs(parsed.query, keep_blank_values=True)
+            ts_size = int(p.get("ts_size", ["0"])[0])
+            if ts_size <= 0:
+                continue
+            m = re.search(r'_(\d+)_ts/', parsed.path)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            if idx in known:
+                continue
+            p["range"] = [f"0-{ts_size - 1}"]
+            p["len"] = [str(ts_size)]
+            full_url = urlunparse(parsed._replace(query=urlencode({k: v[0] for k, v in p.items()})))
+            known[idx] = (idx, full_url, ts_size)
+
+        cur_max = max(known.keys()) if known else -1
+        if cur_max > max_idx:
+            max_idx = cur_max
+            no_new_streak = 0
+        else:
+            no_new_streak += 1
+
+        if known and min(known) <= 1 and len(known) == (max(known) - min(known) + 1):
+            if no_new_streak >= 6:
+                break
+
+        time.sleep(0.2)
+
+    if not known:
+        return []
+
+    return [known[i] for i in sorted(known)]
+
+
+def build_synthetic_m3u8(chunks: list, seg_duration: float = 4.0) -> str:
+    """
+    chunks: list of (idx, signed_cdn_url, ts_size) from discover_all_hls_chunks.
+    Builds a standards-compliant M3U8 manifest pointing directly at TeraBox's
+    real signed CDN .ts URLs, so HLS.js (or any HLS player) can play the FULL
+    video instead of the single random chunk TeraBox's raw endpoint returns.
+    """
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        f"#EXT-X-TARGETDURATION:{int(seg_duration) + 1}",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+    ]
+    for _, url, _ in chunks:
+        lines.append(f"#EXTINF:{seg_duration:.3f},")
+        lines.append(url)
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines)
+
+
+def resolve_playlist(raw_url: str, preferred_quality: str = "M3U8_AUTO_720") -> dict:
+    """
+    Full flow: metadata -> discover real chunks -> build a playable M3U8.
+    Auto-falls back through QUALITIES if the preferred one has 0 chunks
+    (not transcoded / not available for this file or account).
+    """
+    base = resolve_terabox_link(raw_url)
+    session = load_session()
+
+    quality_order = [preferred_quality] + [q for q in QUALITIES if q != preferred_quality]
+
+    for q in quality_order:
+        chunks = discover_all_hls_chunks(
+            session, base["shareid"], base["uk"], base["sign"], base["timestamp"],
+            base["fs_id"], q, surl=base["surl"],
+        )
+        if chunks:
+            manifest = build_synthetic_m3u8(chunks)
+            return {
+                "filename": base["filename"],
+                "size": base["size"],
+                "size_mb": base["size_mb"],
+                "thumb": base["thumb"],
+                "quality_used": q,
+                "chunks_found": len(chunks),
+                "manifest": manifest,
+            }
+
+    raise TeraBoxError(
+        "No playable chunks found at any quality — cookie likely expired/banned, "
+        "or this file isn't transcoded for streaming on this account."
+    )
+
+
 # ── Public function: full metadata + links in one call ─────────────────────
 
 QUALITIES = ["M3U8_AUTO_1080", "M3U8_AUTO_720", "M3U8_AUTO_480", "M3U8_AUTO_360"]
